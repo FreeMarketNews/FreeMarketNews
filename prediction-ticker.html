@@ -1,0 +1,308 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="cache-control" content="no-cache" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Prediction Ticker Overlay</title>
+  <style>
+    :root{
+      --bg: #0b0f14;
+      --fg: #e6edf3;
+      --muted: #9aa3ab;
+      --accent: #2dd4bf;
+      --down: #ef4444;
+      --up: #22c55e;
+      --font: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+      --size: 20px;
+      --pad: 10px;
+      --gap: 24px;
+      --sep: 18px;
+      --titleSize: 16px;
+      --tickerHeight: 48px;
+      --opacity: 0.92;
+    }
+    html, body {
+      height: 100%;
+      margin: 0;
+      padding: 0;
+      background: var(--bg);
+      color: var(--fg);
+      font-family: var(--font);
+      overflow: hidden;
+    }
+    body.transparent { background: rgba(0,0,0,0) !important; }
+    .wrap{
+      position: fixed;
+      inset: 0;
+      display: grid;
+      grid-template-rows: auto 1fr;
+      opacity: var(--opacity);
+    }
+    .header{
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: var(--pad) calc(var(--pad) * 1.5);
+      border-bottom: 1px solid rgba(255,255,255,0.08);
+      background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0));
+    }
+    .dot{ width: 10px; height:10px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 12px var(--accent); }
+    .title{ font-weight:600; font-size: var(--titleSize); letter-spacing: 0.2px; }
+    .time{ color: var(--muted); font-size: 12px; margin-left: auto; }
+    .ticker{
+      height: var(--tickerHeight);
+      display: flex;
+      align-items: center;
+      gap: var(--gap);
+      padding: 0 calc(var(--pad) * 1.5);
+      white-space: nowrap;
+      position: relative;
+      overflow: hidden;
+    }
+    .scroll{
+      position: absolute;
+      left: 100%;
+      display: inline-flex;
+      align-items:center;
+      gap: var(--gap);
+      will-change: transform;
+      animation: scroll linear infinite;
+    }
+    @keyframes scroll {
+      from { transform: translateX(0); }
+      to   { transform: translateX(-100%); }
+    }
+    .item{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: var(--size);
+      line-height: 1;
+      padding-right: var(--sep);
+      border-right: 1px solid rgba(255,255,255,0.08);
+    }
+    .label{ color: var(--muted); font-weight: 500; }
+    .value{ font-variant-numeric: tabular-nums; font-weight: 700; }
+    .trend{ font-size: 14px; }
+    .up{ color: var(--up); }
+    .down{ color: var(--down); }
+    .src{ font-size: 12px; color: var(--muted); opacity: .9; }
+    .empty{
+      height: var(--tickerHeight);
+      display: grid;
+      place-items: center;
+      color: var(--muted);
+      font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="header">
+      <div class="dot"></div>
+      <div class="title" id="title">Prediction Markets</div>
+      <div class="src" id="src"></div>
+      <div class="time" id="time"></div>
+    </div>
+    <div class="ticker" id="ticker">
+      <div class="empty" id="empty">Loading odds…</div>
+    </div>
+  </div>
+
+<script>
+(function(){
+  const qs = new URLSearchParams(location.search);
+  // Brand / style
+  const title = qs.get('title') || 'Prediction Markets';
+  const accent = qs.get('accent') || '#2dd4bf';
+  const bg = qs.get('bg');
+  const fg = qs.get('fg');
+  const size = qs.get('size'); // px
+  const opacity = qs.get('opacity'); // 0..1
+  const transparent = qs.get('transparent') === '1';
+  const speed = parseFloat(qs.get('speed') || '60'); // px/s
+  const pollSec = parseInt(qs.get('poll') || '15', 10); // refresh interval
+  const dupes = parseInt(qs.get('dupes') || '2', 10); // how many times to repeat the row for continuous scroll
+  const showSource = qs.get('showsource') !== '0';
+  const tickerEl = document.getElementById('ticker');
+  const emptyEl = document.getElementById('empty');
+  const titleEl = document.getElementById('title');
+  const timeEl = document.getElementById('time');
+  const srcEl = document.getElementById('src');
+
+  titleEl.textContent = title;
+  document.documentElement.style.setProperty('--accent', accent);
+  if (bg) document.documentElement.style.setProperty('--bg', bg);
+  if (fg) document.documentElement.style.setProperty('--fg', fg);
+  if (size) document.documentElement.style.setProperty('--size', size + 'px');
+  if (opacity) document.documentElement.style.setProperty('--opacity', opacity);
+  if (transparent) document.body.classList.add('transparent');
+
+  // Sources
+  const sources = (qs.get('sources') || 'polymarket').split(',').map(s => s.trim()).filter(Boolean);
+  const pm_ids = (qs.get('pm_ids') || '').split(',').map(s => s.trim()).filter(Boolean);
+  const pm_query = qs.get('pm_query') || ''; // optional free text match
+  const json_url = qs.get('json_url') || ''; // your normalized JSON endpoint
+
+  // State for previous values to show arrows
+  const lastMap = new Map();
+
+  function nowStr(){
+    const d = new Date();
+    return d.toLocaleTimeString(undefined, {hour:'2-digit', minute:'2-digit'});
+  }
+
+  function setClock(){
+    timeEl.textContent = nowStr();
+  }
+  setClock(); setInterval(setClock, 15*1000);
+
+  function animWidth(el){
+    const totalWidth = el.scrollWidth;
+    const w = tickerEl.clientWidth;
+    const run = totalWidth + w;
+    const dur = run / Math.max(speed, 10); // seconds
+    el.style.animationDuration = dur + 's';
+  }
+
+  function buildRow(items){
+    const row = document.createElement('div');
+    row.className = 'scroll';
+    const frag = document.createDocumentFragment();
+    items.forEach(it => {
+      const span = document.createElement('span');
+      span.className = 'item';
+      const label = document.createElement('span');
+      label.className = 'label';
+      label.textContent = it.label;
+      const val = document.createElement('span');
+      val.className = 'value';
+      val.textContent = (it.value * 100).toFixed(0) + '%';
+      const trend = document.createElement('span');
+      trend.className = 'trend ' + (it.delta > 0 ? 'up' : (it.delta < 0 ? 'down' : ''));
+      if (it.delta > 0) trend.textContent = '▲' + Math.abs(it.delta*100).toFixed(0) + '%';
+      else if (it.delta < 0) trend.textContent = '▼' + Math.abs(it.delta*100).toFixed(0) + '%';
+      span.appendChild(label);
+      span.appendChild(val);
+      span.appendChild(trend);
+      frag.appendChild(span);
+    });
+    row.appendChild(frag);
+    return row;
+  }
+
+  function render(items, sourceLabel){
+    emptyEl.remove();
+    tickerEl.querySelectorAll('.scroll').forEach(n => n.remove());
+    const compact = items.filter(Boolean);
+    if (compact.length === 0){
+      const el = document.createElement('div');
+      el.className = 'empty';
+      el.textContent = 'No odds available.';
+      tickerEl.appendChild(el);
+      return;
+    }
+    for (let i=0;i<dupes;i++){
+      const r = buildRow(compact);
+      tickerEl.appendChild(r);
+      // compute animation duration after in DOM
+      requestAnimationFrame(() => animWidth(r));
+    }
+    srcEl.textContent = showSource ? 'Source: ' + sourceLabel : '';
+  }
+
+  async function fetchPolymarket(){
+    // Best-effort public endpoint. Subject to change by Polymarket.
+    // Fallback: user can supply a custom JSON endpoint via json_url.
+    const url = 'https://www.polymarket.com/api/markets?limit=200&active=true';
+    const res = await fetch(url, {mode:'cors'});
+    if (!res.ok) throw new Error('Polymarket API '+res.status);
+    const data = await res.json();
+    // Normalize to {label, value}
+    let rows = data?.markets || data; // handle either shape
+    // Filter by ids or query
+    if (pm_ids.length){
+      rows = rows.filter(m => pm_ids.includes(String(m.id)) || pm_ids.includes(String(m.slug)));
+    } else if (pm_query){
+      const q = pm_query.toLowerCase();
+      rows = rows.filter(m => (m.question || m.title || '').toLowerCase().includes(q));
+    } else {
+      rows = rows.slice(0, 12);
+    }
+    // For each market, pick the "Yes" price or max outcome prob
+    const items = rows.map(m => {
+      const label = (m.question || m.title || m.slug || 'Market').replace(/\s+/g,' ').trim();
+      let p = null;
+      if (Array.isArray(m.outcomes)){
+        // try to find YES
+        const yes = m.outcomes.find(o => /yes/i.test(o.name || o.ticker || ''));
+        if (yes && (yes.price !== undefined || yes.lastPrice !== undefined)){
+          p = (yes.price ?? yes.lastPrice);
+        } else if (m.outcomes.length){
+          const best = m.outcomes.reduce((a,b)=> ((a.price||0)>(b.price||0)?a:b));
+          p = best.price ?? null;
+        }
+      }
+      if (p == null && (m.yesPrice !== undefined)) p = m.yesPrice;
+      if (p == null && (m.lastPrice !== undefined)) p = m.lastPrice;
+      if (p == null && (m.probability !== undefined)) p = m.probability;
+      if (p == null && (m.impliedProbability !== undefined)) p = m.impliedProbability;
+      if (p == null) return null;
+      p = Number(p);
+      if (p > 1) p = p/100; // normalize if 0-100
+      const key = 'pm|' + (m.id ?? m.slug ?? label);
+      const prev = lastMap.get(key);
+      const delta = prev != null ? (p - prev) : 0;
+      lastMap.set(key, p);
+      return { label, value: p, delta };
+    }).filter(Boolean);
+    return items;
+  }
+
+  async function fetchJSON(){
+    if (!json_url) return [];
+    const res = await fetch(json_url, {mode:'cors'});
+    if (!res.ok) throw new Error('JSON source '+res.status);
+    const data = await res.json();
+    // Expected schema: [{label:"Fed cut", value:0.32}, ...]
+    const items = Array.isArray(data) ? data : (data.items || []);
+    return items.map((d,i) => {
+      let v = Number(d.value);
+      if (v > 1) v = v/100;
+      const key = 'json|' + (d.id ?? d.label ?? i);
+      const prev = lastMap.get(key);
+      const delta = prev != null ? (v - prev) : 0;
+      lastMap.set(key, v);
+      return { label: String(d.label || 'Item '+(i+1)), value: v, delta };
+    });
+  }
+
+  async function tick(){
+    try{
+      const tasks = [];
+      let sourceLabel = [];
+      if (sources.includes('polymarket')){
+        tasks.push(fetchPolymarket().catch(()=>[]));
+        sourceLabel.push('Polymarket');
+      }
+      if (sources.includes('json') && json_url){
+        tasks.push(fetchJSON().catch(()=>[]));
+        sourceLabel.push('Custom JSON');
+      }
+      const results = await Promise.all(tasks);
+      const items = results.flat();
+      render(items, sourceLabel.join(' + ') || 'None');
+    }catch(e){
+      console.error(e);
+      srcEl.textContent = 'Source error';
+    }
+  }
+
+  tick();
+  setInterval(tick, Math.max(5, pollSec) * 1000);
+})();
+</script>
+</body>
+</html>
